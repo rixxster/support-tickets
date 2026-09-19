@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import hmac
+import json
 import os
 import random
 import secrets
@@ -11,6 +12,7 @@ import altair as alt
 import extra_streamlit_components as stx
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Support tickets", page_icon="🎫")
@@ -35,6 +37,7 @@ DATABASE_PATH = Path(os.getenv("SUPPORT_DB_PATH", "support_tickets.db"))
 COOKIE_NAME = "support_ticket_auth"
 COOKIE_SECRET = os.getenv("SUPPORT_COOKIE_SECRET", "development-cookie-secret")
 COOKIE_DAYS = 30
+YAHOO_HEADERS = {"User-Agent": "support-tickets-market-data/1.0"}
 
 
 def get_connection():
@@ -56,6 +59,205 @@ def password_matches(password, stored_hash):
         return False
     actual_digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000).hex()
     return hmac.compare_digest(actual_digest, expected_digest)
+
+
+def load_symbol_records(query=""):
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT symbol, name, exchange, quote_type AS type
+            FROM market_symbols
+            WHERE symbol LIKE ? OR name LIKE ?
+            ORDER BY name
+            """,
+            (f"%{query}%", f"%{query}%"),
+        ).fetchall()
+    return tuple(dict(row) for row in rows)
+
+
+def save_symbol_records(symbols, source):
+    fetched_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with get_connection() as connection:
+        connection.executemany(
+            """
+            INSERT INTO market_symbols (symbol, name, exchange, quote_type, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                name = excluded.name, exchange = excluded.exchange,
+                quote_type = excluded.quote_type, source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            [
+                (item["symbol"], item["name"], item.get("exchange", ""),
+                 item.get("type", ""), source, fetched_at)
+                for item in symbols
+            ],
+        )
+
+
+def save_market_chart(symbol, frame, metadata, raw_payload):
+    fetched_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO market_quotes VALUES (?, ?, ?, ?)",
+            (symbol, json.dumps(metadata), json.dumps(raw_payload), fetched_at),
+        )
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO market_prices
+                (symbol, price_date, open, high, low, close, volume, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (symbol, str(row["Date"]), row.get("open"), row.get("high"),
+                 row.get("low"), row.get("close"), row.get("volume"), fetched_at)
+                for _, row in frame.iterrows()
+            ],
+        )
+
+
+def load_market_chart(symbol):
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT price_date AS Date, open, high, low, close, volume FROM market_prices WHERE symbol = ? ORDER BY price_date",
+            (symbol,),
+        ).fetchall()
+        quote = connection.execute(
+            "SELECT metadata_json, raw_json FROM market_quotes WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+    if not rows or not quote:
+        return None
+    frame = pd.DataFrame([dict(row) for row in rows])
+    frame["Date"] = pd.to_datetime(frame["Date"]).dt.date
+    return frame, json.loads(quote["metadata_json"]), json.loads(quote["raw_json"])
+
+
+def save_market_news(symbol, news):
+    fetched_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with get_connection() as connection:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO market_news
+                (symbol, news_id, title, link, publisher, published_at, raw_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (symbol, item.get("uuid") or item.get("link") or secrets.token_hex(8),
+                 item.get("title", "Untitled"), item.get("link", ""),
+                 item.get("publisher", ""), item.get("providerPublishTime"),
+                 json.dumps(item), fetched_at)
+                for item in news
+            ],
+        )
+
+
+def load_market_news(symbol):
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT raw_json FROM market_news WHERE symbol = ? ORDER BY published_at DESC LIMIT 20",
+            (symbol,),
+        ).fetchall()
+    return tuple(json.loads(row["raw_json"]) for row in rows)
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def get_sp500_tickers():
+    stored_symbols = load_symbol_records("")
+    stored_sp500 = tuple(symbol for symbol in stored_symbols if symbol["exchange"] == "S&P 500")
+    if stored_sp500:
+        return stored_sp500
+    response = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers=YAHOO_HEADERS,
+        timeout=15,
+    )
+    response.raise_for_status()
+    tables = pd.read_html(response.text)
+    table = next(table for table in tables if "Symbol" in table.columns)
+    symbols = tuple(
+        {
+            "symbol": str(row.Symbol).replace(".", "-"),
+            "name": str(row.Security),
+            "exchange": "S&P 500",
+        }
+        for row in table.itertuples()
+    )
+    save_symbol_records(symbols, "S&P 500")
+    return symbols
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def search_yahoo_symbols(query):
+    if not query.strip():
+        return ()
+    stored_symbols = load_symbol_records(query.strip())
+    if stored_symbols:
+        return stored_symbols[:20]
+    response = requests.get(
+        "https://query1.finance.yahoo.com/v1/finance/search",
+        params={"q": query.strip(), "quotesCount": 20, "newsCount": 0},
+        headers=YAHOO_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    quotes = response.json().get("quotes", [])
+    symbols = tuple(
+        {
+            "symbol": quote.get("symbol", ""),
+            "name": quote.get("longname") or quote.get("shortname") or quote.get("symbol", ""),
+            "exchange": quote.get("exchange", ""),
+            "type": quote.get("quoteType", ""),
+        }
+        for quote in quotes
+        if quote.get("symbol")
+    )
+    save_symbol_records(symbols, "Yahoo search")
+    return symbols
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_yahoo_chart(symbol, range_name="1y", interval="1d"):
+    stored_chart = load_market_chart(symbol)
+    if stored_chart:
+        return stored_chart
+    response = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        params={"range": range_name, "interval": interval, "events": "history"},
+        headers=YAHOO_HEADERS,
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    result = payload.get("chart", {}).get("result") or []
+    if not result:
+        raise ValueError(payload.get("chart", {}).get("error", {}).get("description", "No chart data returned"))
+    chart = result[0]
+    timestamps = chart.get("timestamp", [])
+    quote = (chart.get("indicators", {}).get("quote") or [{}])[0]
+    frame = pd.DataFrame(quote)
+    frame.insert(0, "Date", pd.to_datetime(timestamps, unit="s", utc=True).date)
+    frame = frame.dropna(subset=["close"])
+    metadata = chart.get("meta", {})
+    save_market_chart(symbol, frame, metadata, payload)
+    return frame, metadata, payload
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_yahoo_news(query):
+    stored_news = load_market_news(query)
+    if stored_news:
+        return stored_news
+    response = requests.get(
+        "https://query1.finance.yahoo.com/v1/finance/search",
+        params={"q": query, "quotesCount": 0, "newsCount": 20},
+        headers=YAHOO_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    news = tuple(response.json().get("news", []))
+    save_market_news(query, news)
+    return news
 
 
 def initialise_database():
@@ -82,6 +284,42 @@ def initialise_database():
                 name TEXT NOT NULL UNIQUE,
                 email TEXT NOT NULL,
                 company TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS market_symbols (
+                symbol TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                exchange TEXT NOT NULL DEFAULT '',
+                quote_type TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS market_quotes (
+                symbol TEXT PRIMARY KEY,
+                metadata_json TEXT NOT NULL,
+                raw_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS market_prices (
+                symbol TEXT NOT NULL,
+                price_date TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, price_date)
+            );
+            CREATE TABLE IF NOT EXISTS market_news (
+                symbol TEXT NOT NULL,
+                news_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                link TEXT NOT NULL,
+                publisher TEXT NOT NULL,
+                published_at INTEGER,
+                raw_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, news_id)
             );
             """
         )
@@ -401,6 +639,87 @@ def render_tickets(is_admin):
     st.altair_chart(priority_plot, use_container_width=True, theme="streamlit")
 
 
+def render_market_data():
+    st.title("Market data")
+    st.write("Search S&P 500 companies or any symbol recognized by Yahoo Finance.")
+
+    search_text = st.text_input(
+        "Search ticker or company",
+        placeholder="Try NVDA, Apple, bitcoin, or EURUSD=X",
+    ).strip()
+    try:
+        sp500 = list(get_sp500_tickers())
+    except (requests.RequestException, ValueError, StopIteration) as error:
+        sp500 = []
+        st.warning(f"Could not load the S&P 500 list: {error}")
+
+    search_matches = []
+    if search_text:
+        search_matches = [
+            match for match in sp500
+            if search_text.lower() in f"{match['symbol']} {match['name']}".lower()
+        ]
+        try:
+            search_matches.extend(search_yahoo_symbols(search_text))
+        except requests.RequestException as error:
+            st.warning(f"Yahoo symbol search is temporarily unavailable: {error}")
+
+    choices = []
+    seen_symbols = set()
+    for match in search_matches + (sp500 if not search_text else []):
+        if match["symbol"] not in seen_symbols:
+            choices.append(match)
+            seen_symbols.add(match["symbol"])
+    if not choices:
+        st.info("Type a ticker or company name to search Yahoo Finance.")
+        return
+
+    selected = st.selectbox(
+        "Ticker",
+        choices,
+        format_func=lambda item: f"{item['symbol']} - {item['name']}",
+    )
+    symbol = selected["symbol"]
+    range_name = st.selectbox("History", ["1mo", "3mo", "6mo", "1y", "5y", "max"], index=3)
+
+    try:
+        history, metadata, raw_chart = get_yahoo_chart(symbol, range_name)
+    except (requests.RequestException, ValueError, KeyError) as error:
+        st.error(f"Yahoo Finance could not return data for {symbol}: {error}")
+        return
+
+    current_price = metadata.get("regularMarketPrice")
+    previous_close = metadata.get("previousClose")
+    change = current_price - previous_close if current_price is not None and previous_close is not None else None
+    metrics = st.columns(4)
+    metrics[0].metric("Price", current_price if current_price is not None else "N/A", delta=change)
+    metrics[1].metric("Currency", metadata.get("currency", "N/A"))
+    metrics[2].metric("Exchange", metadata.get("exchangeName", selected.get("exchange", "N/A")))
+    metrics[3].metric("Data points", len(history))
+
+    st.subheader(f"{symbol} price history")
+    st.line_chart(history.set_index("Date")["close"], y_label="Close")
+
+    news_tab, data_tab = st.tabs(["News", "Raw Yahoo data"])
+    with news_tab:
+        try:
+            news = get_yahoo_news(symbol)
+            if not news:
+                st.info("No recent Yahoo Finance news was returned.")
+            for item in news:
+                title = item.get("title", "Untitled")
+                link = item.get("link", "")
+                publisher = item.get("publisher", "")
+                published = item.get("providerPublishTime")
+                date = datetime.datetime.fromtimestamp(published).strftime("%Y-%m-%d") if published else ""
+                st.markdown(f"[{title}]({link})  \n{publisher} {date}")
+        except requests.RequestException as error:
+            st.warning(f"Yahoo news is temporarily unavailable: {error}")
+
+    with data_tab:
+        st.json(raw_chart)
+
+
 initialise_database()
 cookie_manager = stx.CookieManager()
 account = restore_login(cookie_manager)
@@ -416,12 +735,16 @@ with st.sidebar:
         st.rerun()
     view = st.radio(
         "View",
-        ["Tickets", "Accounts", "Customers"] if account["role"] == "admin" else ["Tickets"],
+        ["Tickets", "Market data", "Accounts", "Customers"]
+        if account["role"] == "admin"
+        else ["Tickets", "Market data"],
     )
 
 if view == "Accounts":
     render_account_admin()
 elif view == "Customers":
     render_customer_admin()
+elif view == "Market data":
+    render_market_data()
 else:
     render_tickets(account["role"] == "admin")

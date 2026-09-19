@@ -34,3 +34,15 @@ logs all browsers out.
 Administrators can manage customer accounts from the **Customers** view and
 assign customers when creating or editing tickets. Existing databases are
 upgraded automatically with the customer table and ticket relationship.
+
+### Market data
+
+The **Market data** view searches Yahoo Finance symbols while you type, loads
+the S&P 500 company list, and shows quote metadata, historical prices, news,
+and the raw Yahoo chart response. Results are cached briefly to reduce API
+traffic. Yahoo Finance does not publish a guaranteed complete list of every
+symbol, so symbols outside the S&P 500 are discovered through Yahoo search.
+
+Successful symbol searches, quote responses, daily price history, and news are
+also stored in the SQLite database. The app reads stored records first on
+later visits and only calls Yahoo when matching data has not been saved yet.
