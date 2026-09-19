@@ -14,6 +14,14 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Support tickets", page_icon="🎫")
+st.markdown(
+    """
+    <style>
+        footer { visibility: hidden; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 DATABASE_PATH = Path(os.getenv("SUPPORT_DB_PATH", "support_tickets.db"))
 COOKIE_NAME = "support_ticket_auth"
