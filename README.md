@@ -23,6 +23,14 @@ A simple Streamlit app showing an internal tool that lets you create, manage, an
 The first account is the administrator. For local development, sign in with
 `admin` / `admin`. Set `SUPPORT_ADMIN_PASSWORD` to choose a different initial
 admin password before deployment. Administrators can add, modify, and remove
-accounts from the **Accounts** view. Accounts are stored in the current
-Streamlit session, so use a database-backed store if account changes must
-survive app restarts or be shared across processes.
+accounts from the **Accounts** view. Accounts and tickets are stored in
+`support_tickets.db` using SQLite, so they survive app restarts. Set
+`SUPPORT_DB_PATH` to use another database location.
+
+Login is retained for 30 days with a signed browser cookie. Set
+`SUPPORT_COOKIE_SECRET` to a long random value before deployment; changing it
+logs all browsers out.
+
+Administrators can manage customer accounts from the **Customers** view and
+assign customers when creating or editing tickets. Existing databases are
+upgraded automatically with the customer table and ticket relationship.
