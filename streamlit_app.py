@@ -17,7 +17,15 @@ st.set_page_config(page_title="Support tickets", page_icon="🎫")
 st.markdown(
     """
     <style>
-        footer { visibility: hidden; }
+        #MainMenu,
+        footer,
+        .stDeployButton,
+        .stAppDeployButton,
+        [data-testid="stFooter"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"] {
+            display: none !important;
+        }
     </style>
     """,
     unsafe_allow_html=True,
