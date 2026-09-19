@@ -17,3 +17,12 @@ A simple Streamlit app showing an internal tool that lets you create, manage, an
    ```
    $ streamlit run streamlit_app.py
    ```
+
+### Accounts
+
+The first account is the administrator. For local development, sign in with
+`admin` / `admin`. Set `SUPPORT_ADMIN_PASSWORD` to choose a different initial
+admin password before deployment. Administrators can add, modify, and remove
+accounts from the **Accounts** view. Accounts are stored in the current
+Streamlit session, so use a database-backed store if account changes must
+survive app restarts or be shared across processes.
