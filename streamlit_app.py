@@ -332,7 +332,7 @@ def save_tickets(dataframe):
         )
 
 
-def render_tickets():
+def render_tickets(is_admin):
     st.title("🎫 Support tickets")
     st.write("Create, manage, and visualize internal support tickets.")
     tickets = get_tickets()
@@ -359,15 +359,21 @@ def render_tickets():
 
     st.header("Existing tickets")
     st.write(f"Number of tickets: `{len(tickets)}`")
+    if is_admin:
+        st.info("As an administrator, you can edit ticket details directly in the table.")
+    else:
+        st.info("Ticket details are read-only. Contact an administrator to make changes.")
     edited_tickets = st.data_editor(
         tickets, use_container_width=True, hide_index=True,
         column_config={
             "Status": st.column_config.SelectboxColumn("Status", options=["Open", "In Progress", "Closed"], required=True),
             "Priority": st.column_config.SelectboxColumn("Priority", options=["High", "Medium", "Low"], required=True),
             "Customer": st.column_config.SelectboxColumn("Customer", options=customer_names, required=True),
-        }, disabled=["ID", "Date Submitted"],
+        },
+        disabled=[] if is_admin else list(tickets.columns),
     )
-    save_tickets(edited_tickets)
+    if is_admin:
+        save_tickets(edited_tickets)
     st.header("Statistics")
     col1, col2, col3 = st.columns(3)
     col1.metric("Number of open tickets", len(edited_tickets[edited_tickets.Status == "Open"]), delta=10)
@@ -402,4 +408,4 @@ if view == "Accounts":
 elif view == "Customers":
     render_customer_admin()
 else:
-    render_tickets()
+    render_tickets(account["role"] == "admin")
